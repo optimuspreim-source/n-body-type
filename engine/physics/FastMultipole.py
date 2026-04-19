@@ -21,7 +21,7 @@ Algorithmus  (auf BH-Octree aufgebaut, Ordnung p=2)
 ════════════════════════════════════════════════════════════════════════════════
 """
 import numpy as np
-from numba import njit, prange
+from numba import njit, prange  # type: ignore
 
 _INS_STACK  = 256
 _FORC_STACK = 512

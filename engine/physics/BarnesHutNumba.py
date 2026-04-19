@@ -29,7 +29,7 @@ Implementierungsdetails
 ════════════════════════════════════════════════════════════════════════════════
 """
 import numpy as np
-from numba import njit, prange
+from numba import njit, prange  # type: ignore
 
 _INS_STACK  = 256   # max. Stack-Tiefe pro Partikel-Insertion  (log8(N)·2 + Reserve)
 _FORC_STACK = 512   # max. Stack-Tiefe für Kraft-Traversierung

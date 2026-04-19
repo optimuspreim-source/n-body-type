@@ -35,13 +35,69 @@ Numerik
   Alle Array-Operationen vektorisiert (NumPy).
 ════════════════════════════════════════════════════════════════════════════════
 """
+import math
 import numpy as np
+from numba import njit  # type: ignore[import-untyped]
 
 _SN_MASS_MIN  = 2.5     # Minimalmasse für core-collapse SN [Simulationseinheiten]
 _ETA_KINETIC  = 0.08    # Kinetischer Wirkungsgrad der SN-Energie
 _WIND_FRAC    = 0.0010  # Relative Massenverlustrate pro Schritt (AGB-Winde)
 _WIND_DISP    = 0.006   # Velocity-Dispersion durch stellare Winde [Simul.-Einh./Schritt]
 _Z_SOLAR      = 0.02    # Solare Metallizität (Massenbruch)
+
+
+# ─ Numba-JIT Batch-SN-Kernel ───────────────────────────────────────────────
+# Verarbeitet alle SN-Ereignisse eines Schritts in zwei O(N)-Pässen pro SN:
+# 1. Nachbarn zählen (kein Alloc), 2. Geschwindigkeit + Metallizität updaten.
+# Im Vergleich zur NumPy-Version: kein temp-Array-Alloc, kein Python-Loop-Overhead.
+
+@njit(cache=True, fastmath=True)
+def _sn_kernel(sn_pos, sn_mass, pos, vel, Z, mass, r_fb2, eta_kin, E_SN, yield_frac):
+    """
+    Führt ALLE SN-Explosionen + Metallizitäts-Anreicherung des aktuellen Schritts durch.
+    sn_pos  : (K, 3) float64  – Positionen der K Supernovae
+    sn_mass : (K,)   float64  – Massen der K Supernovae (vor Remnant-Cut)
+    Modifiziert vel und Z **in-place** (Massen der SN-Sterne werden außerhalb behandelt).
+    """
+    N   = pos.shape[0]
+    K   = sn_pos.shape[0]
+    for s in range(K):
+        px = sn_pos[s, 0]; py = sn_pos[s, 1]; pz = sn_pos[s, 2]
+        m_s = sn_mass[s]   # korrekte Masse des s-ten SN-Sterns
+
+        # Pass 1: Nachbarn zählen
+        n_nb = 0
+        for j in range(N):
+            if mass[j] <= 0.:
+                continue
+            dx = pos[j, 0] - px
+            dy = pos[j, 1] - py
+            dz = pos[j, 2] - pz
+            r2 = dx*dx + dy*dy + dz*dz
+            if 1e-4 < r2 < r_fb2:
+                n_nb += 1
+
+        if n_nb == 0:
+            continue
+
+        dv_mag = math.sqrt(2.0 * eta_kin * E_SN / n_nb)
+        dZ_each = yield_frac * m_s * 4e-5 / n_nb
+
+        # Pass 2: Velocity-Kick + Metallizitäts-Anreicherung
+        for j in range(N):
+            if mass[j] <= 0.:
+                continue
+            dx = pos[j, 0] - px
+            dy = pos[j, 1] - py
+            dz = pos[j, 2] - pz
+            r2 = dx*dx + dy*dy + dz*dz
+            if 1e-4 < r2 < r_fb2:
+                r = math.sqrt(r2)
+                vel[j, 0] += (dx / r) * dv_mag
+                vel[j, 1] += (dy / r) * dv_mag
+                vel[j, 2] += (dz / r) * dv_mag
+                new_Z = Z[j] + dZ_each
+                Z[j] = new_Z if new_Z < 0.25 else 0.25
 
 
 class StellarFeedback:
@@ -85,11 +141,12 @@ class StellarFeedback:
 
         # ── Metallizität: normalverteilt um Z_solar, zufällige Variation ─
         # Leicht erhöht im Zentrum (vorangegangene SN-Episoden).
-        self.Z = rng.normal(_Z_SOLAR, 0.003, N).clip(0.002, 0.30).astype(np.float64)
+        self.Z = rng.normal(_Z_SOLAR, 0.003, N).clip(0.002, 0.30).astype(np.float64)  # type: ignore[union-attr]
         self.Z[bh_mask] = 0.
 
         # ── Diagnostik-Zähler ────────────────────────────────────────────
         self.total_sn    = 0    # Supernova-Ereignisse gesamt
+        self._total_sn   = 0    # interner Alias (Konsistenz mit Viewer)
         self.last_sn     = 0    # SNe im letzten Schritt
 
     # ─────────────────────────────────────────────────────────────────────
@@ -109,18 +166,20 @@ class StellarFeedback:
         sn_mask = active_star & (self.age >= self.lifetime) & (mass >= _SN_MASS_MIN)
         sn_idx  = np.where(sn_mask)[0]
 
-        for i in sn_idx:
-            self._explode(i, pos, vel, mass)
-            # Remnant: Neutronenstern / stellares BH  (~12% Sternmasse, min 0.5)
-            mass[i] = max(float(mass[i]) * 0.12, 0.5)
-            # SN-Ejecta reichern Nachbarn mit Metallen an (O, Mg, Si, Fe)
-            self._enrich_sn(i, pos, mass)
-            # Remnant altert nicht mehr (sehr lange Lebensdauer)
-            self.age[i]      = 0.
-            self.lifetime[i] = 1e18
-
-        self.last_sn   = len(sn_idx)
-        self.total_sn += self.last_sn
+        if len(sn_idx) > 0:
+            # Batch-Kernel: alle SNe dieses Schritts in einer Numba-Routine
+            sn_pos  = pos[sn_idx].copy()
+            sn_mass = mass[sn_idx].copy()   # Massen VOR Remnant-Cut
+            _sn_kernel(sn_pos, sn_mass, pos, vel, self.Z, mass,
+                       self.r_fb2, _ETA_KINETIC, self.E_SN, 0.30)
+            # Remnant-Masse + Alters-Reset (Python-Schleife über K ≪ N)
+            for i in sn_idx:
+                mass[i] = max(float(mass[i]) * 0.12, 0.5)
+                self.age[i]      = 0.
+                self.lifetime[i] = 1e18
+            self._total_sn += len(sn_idx)
+            self.total_sn  += len(sn_idx)
+        self.last_sn = len(sn_idx)
 
         # ── AGB-Stellarwinde: ältere leichte Sterne (späte Entwicklung) ──
         agb_mask = (active_star
@@ -139,37 +198,6 @@ class StellarFeedback:
             n_wind = len(agb_idx)
 
         return self.last_sn, n_wind
-
-    # ─────────────────────────────────────────────────────────────────────
-    def _explode(self, i, pos, vel, mass):
-        """
-        SN-Explosion: kinetische Energie gleichmäßig auf Nachbarn im r_fb.
-        Δv = √(2·η·E_SN / N_nb)  radial nach außen.
-        """
-        dr   = pos - pos[i][np.newaxis, :]
-        r2   = (dr * dr).sum(axis=1)
-        mask = (r2 < self.r_fb2) & (r2 > 1e-4) & (mass > 0.)
-        nb   = np.where(mask)[0]
-        if len(nb) == 0:
-            return
-
-        dv_mag = np.sqrt(2. * _ETA_KINETIC * self.E_SN / len(nb))
-        r_nb   = np.sqrt(r2[nb])
-        # Radiale Einheitsvektoren (SN-Zentrum → Nachbar)
-        vel[nb] += (dr[nb] / r_nb[:, np.newaxis]) * dv_mag
-
-    def _enrich_sn(self, i, pos, mass, yield_frac=0.30):
-        """
-        Metallizitäts-Anreicherung durch SN-Ejecta.
-        ~30% der Sternmasse wird als Metall-Yield an Nachbarn verteilt.
-        """
-        dr   = pos - pos[i][np.newaxis, :]
-        r2   = (dr * dr).sum(axis=1)
-        mask = (r2 < self.r_fb2) & (r2 > 1e-4) & (mass > 0.)
-        nb   = np.where(mask)[0]
-        if len(nb) > 0:
-            dZ = yield_frac * float(mass[i]) * 4e-5 / max(len(nb), 1)
-            self.Z[nb] = np.minimum(self.Z[nb] + dZ, 0.25)
 
     # ─────────────────────────────────────────────────────────────────────
     def metallicity_colors(self):

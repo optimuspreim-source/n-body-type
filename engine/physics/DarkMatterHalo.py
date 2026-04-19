@@ -25,7 +25,43 @@ Numerik
   Halo-Zentren folgen dem zugehörigen SMBH (dynamisch aktualisierbar).
 ════════════════════════════════════════════════════════════════════════════════
 """
+import math
 import numpy as np
+from numba import njit, prange  # type: ignore[import-untyped]
+
+# ─ CuPy-GPU-Erkennung ──────────────────────────────────────────────────
+try:
+    import cupy as _cp  # type: ignore[import]
+    _cp.zeros(1)
+    _GPU = True
+except Exception:
+    _cp  = None
+    _GPU = False
+
+
+# ─ Numba-parallel NFW-Kernel (CPU-Fallback für kein GPU) ───────────────
+@njit(parallel=True, fastmath=True, cache=True)
+def _nfw_accel_kernel(pos, cx, cy, cz, norm, r_s, G):
+    """
+    Parallelisierte NFW-Beschleunigung: O(N) mit prange über alle Partikel.
+    Kein NumPy-Overhead, kein temporäres Array-Alloc.
+    """
+    N   = pos.shape[0]
+    out = np.empty((N, 3), dtype=np.float64)
+    for i in prange(N):
+        dx = pos[i, 0] - cx
+        dy = pos[i, 1] - cy
+        dz = pos[i, 2] - cz
+        r  = math.sqrt(dx*dx + dy*dy + dz*dz)
+        if r < 0.5:
+            r = 0.5
+        x     = r / r_s
+        M_enc = norm * (math.log(1.0 + x) - x / (1.0 + x))
+        a     = G * M_enc / (r * r * r)
+        out[i, 0] = -a * dx
+        out[i, 1] = -a * dy
+        out[i, 2] = -a * dz
+    return out
 
 
 class NFWHalo:
@@ -58,15 +94,25 @@ class NFWHalo:
         pos    : (N, 3) float64
         return : (N, 3) Beschleunigung in Simulationseinheiten
         """
-        dr  = pos - self.center[np.newaxis, :]        # (N, 3)
-        r   = np.linalg.norm(dr, axis=1)              # (N,)
-        r   = np.maximum(r, 0.5)                       # Regularisierung
-
-        x     = r / self.r_s
-        M_enc = self._norm * (np.log(1. + x) - x / (1. + x))  # (N,)
-
-        a_mag = self.G * M_enc / (r * r)               # (N,)
-        return -(a_mag / r)[:, np.newaxis] * dr         # (N, 3)
+        if _GPU:
+            try:
+                cp = _cp
+                pos_g    = cp.asarray(pos)                                    # type: ignore[union-attr]
+                center_g = cp.asarray(self.center)[cp.newaxis, :]             # type: ignore[union-attr]
+                dr       = pos_g - center_g                      # (N, 3)
+                r        = cp.maximum(cp.linalg.norm(dr, axis=1), 0.5)        # type: ignore[union-attr]
+                x        = r / self.r_s
+                M_enc    = self._norm * (cp.log(1. + x) - x / (1. + x))       # type: ignore[union-attr]
+                a_mag    = self.G * M_enc / (r * r)
+                return (-(a_mag / r)[:, cp.newaxis] * dr).get()               # type: ignore[union-attr]
+            except Exception:
+                pass   # GPU-Fehler → CPU-Fallback
+        # Numba-parallel Kernel (kein GPU, nutzt alle CPU-Kerne, kein temp-Alloc)
+        return _nfw_accel_kernel(pos,
+                                  float(self.center[0]),
+                                  float(self.center[1]),
+                                  float(self.center[2]),
+                                  self._norm, self.r_s, self.G)
 
     def circular_velocity(self, r_arr):
         """

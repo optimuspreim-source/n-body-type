@@ -29,7 +29,25 @@ Tastatur-Backend-Wechsel in Viewer: Taste 'B'
 ════════════════════════════════════════════════════════════════════════════════
 """
 import numpy as np
-from numba import njit, prange
+from numba import njit, prange  # type: ignore[import-untyped]
+
+# ─ CuPy-GPU-Erkennung (cuFFT ≈10–100× schneller als numpy.fft für 128³/256³-Gitter) ─
+try:
+    import cupy as _cp  # type: ignore
+    _cp.zeros(1)        # testet ob CUDA tatsächlich verfügbar ist
+    GPU_AVAILABLE = True
+except Exception:
+    _cp = None
+    GPU_AVAILABLE = False
+
+# ─ scipy.fft: multithreaded FFT (3–8× schneller als numpy.fft, nutzt alle CPU-Kerne) ─
+try:
+    from scipy.fft import rfftn as _rfftn, irfftn as _irfftn  # type: ignore
+    _FFT_KW = {'workers': -1}   # alle CPU-Kerne nutzen
+except ImportError:
+    _rfftn  = np.fft.rfftn
+    _irfftn = np.fft.irfftn
+    _FFT_KW = {}   # numpy.fft kennt kein workers-Argument
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -87,17 +105,18 @@ def _cic_deposit(pos, mass, rho, M, h, x0, y0, z0):
                     rho[jx, jy, jz] += m * wx * wy * wz
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, parallel=True)
 def _cic_interpolate(pos, mass, force_grid, accel, M, h, x0, y0, z0):
     """
     CIC Force-Interpolation  vom Gitter auf Partikel.
     force_grid : (M,M,M,3) float64  – Kräfte auf Gitter
     accel      : (N,3) float64       – Output (in-place geschrieben)
+    Parallelisiert mit prange – jedes Partikel schreibt in seinen eigenen Index.
     """
     N = pos.shape[0]
     inv_h = 1.0 / h
 
-    for i in range(N):
+    for i in prange(N):   # parallel: jede Zeile in accel gehört exklusiv zu Partikel i
         if mass[i] <= 0.:
             accel[i, 0] = 0.; accel[i, 1] = 0.; accel[i, 2] = 0.
             continue
@@ -171,10 +190,22 @@ class ParticleMeshSolver:
         # Greens-Funktion im k-Raum vorberechnen (periodisches Gitter)
         # Φ̂(k) = -4πG ρ̂(k) / k²_gitter
         # k_gitter = 2πn/L, aber für diskrete FFT: sin-basierter Kernel
-        self._green_k = None   # wird bei erstem compute_accel aufgebaut
+        self._green_k: "np.ndarray | None" = None   # wird bei erstem compute_accel aufgebaut  # type: ignore[annotation-unchecked]
         self._last_box_size = None
 
-        print(f'[PM] Gitter={M}³={M**3}  Auflösung≈{box_size/M:.1f}  G={G}')
+        # ── GPU-Puffer (CuPy) ───────────────────────────────────────────────
+        self._use_gpu = GPU_AVAILABLE
+        if self._use_gpu:
+            try:
+                self._rho_g       = _cp.zeros((M, M, M), dtype=_cp.float64)  # type: ignore[union-attr]
+                # Kernel-Arrays werden in _build_green hochgeladen
+                self._green_k_g   = None
+                self._kx_g = self._ky_g = self._kz_g = None
+            except Exception:
+                self._use_gpu = False
+
+        gpu_tag = '  [GPU-cuFFT]' if self._use_gpu else ''
+        print(f'[PM] Gitter={M}³={M**3}  Auflösung≈{box_size/M:.1f}  G={G}{gpu_tag}')
 
     # ── interne Helfer ───────────────────────────────────────────────────
 
@@ -231,7 +262,16 @@ class ParticleMeshSolver:
 
         self._last_box_size = self._box_size
 
-    # ── Hauptmethode ─────────────────────────────────────────────────────
+        # GPU-Kernel-Arrays hochladen (nach jedem _build_green-Aufruf)
+        if self._use_gpu:
+            try:
+                Mh = self.M // 2 + 1
+                self._green_k_g = _cp.asarray(self._green_k[:, :, :Mh])  # type: ignore[union-attr]
+                self._kx_g      = _cp.asarray(self._kx[:, :, :Mh])       # type: ignore[union-attr]
+                self._ky_g      = _cp.asarray(self._ky[:, :, :Mh])       # type: ignore[union-attr]
+                self._kz_g      = _cp.asarray(self._kz[:, :, :Mh])       # type: ignore[union-attr]
+            except Exception:
+                self._use_gpu = False
 
     def compute_accel(self, pos, mass):
         """
@@ -259,31 +299,35 @@ class ParticleMeshSolver:
         # In Dichte umrechnen: ρ = m / h³
         self._rho /= self._h ** 3
 
-        # 2. FFT der Dichte
-        rho_k = np.fft.rfftn(self._rho)
-
-        # 3. Potential im k-Raum  (nur rfft-Hälfte)
-        # green_k hat volle Symmetrie, rho_k ist rfft → nehme erste Hälfte
-        M = self.M
+        # 2–5. FFT + Potential + Gradient + IFFT  (GPU wenn verfügbar, sonst CPU)
+        M  = self.M
         Mh = M // 2 + 1
-        phi_k = rho_k * self._green_k[:, :, :Mh]
 
-        # 4. Kräfte = -ik · Φ̂   (Gradient)
-        # ax_k = -i kx Φ̂,  usw.
-        ax_k = (-1j * self._kx[:, :, :Mh]) * phi_k
-        ay_k = (-1j * self._ky[:, :, :Mh]) * phi_k
-        az_k = (-1j * self._kz[:, :, :Mh]) * phi_k
-
-        # 5. IFFT → Kräfte im Realraum
-        ax_r = np.fft.irfftn(ax_k, s=(M, M, M))
-        ay_r = np.fft.irfftn(ay_k, s=(M, M, M))
-        az_r = np.fft.irfftn(az_k, s=(M, M, M))
-
-        # Force-Grid zusammenführen
-        # Skalieren: a = F/m, aber F aus Potential → Einheit korrekt durch h³-Normierung
-        self._force_grid[:, :, :, 0] = ax_r
-        self._force_grid[:, :, :, 1] = ay_r
-        self._force_grid[:, :, :, 2] = az_r
+        if self._use_gpu:
+            try:
+                # rho in GPU-Puffer kopieren (kein neues Alloc)
+                _cp.copyto(self._rho_g, _cp.asarray(self._rho))              # type: ignore[union-attr]
+                rho_k = _cp.fft.rfftn(self._rho_g)                           # type: ignore[union-attr]
+                phi_k = rho_k * self._green_k_g
+                ax_r  = _cp.fft.irfftn((-1j * self._kx_g) * phi_k, s=(M, M, M)).get()  # type: ignore[union-attr]
+                ay_r  = _cp.fft.irfftn((-1j * self._ky_g) * phi_k, s=(M, M, M)).get()  # type: ignore[union-attr]
+                az_r  = _cp.fft.irfftn((-1j * self._kz_g) * phi_k, s=(M, M, M)).get()  # type: ignore[union-attr]
+            except Exception:
+                self._use_gpu = False   # GPU-Fehler → einmalig auf CPU zurückfallen
+                assert self._green_k is not None
+                rho_k = np.fft.rfftn(self._rho)
+                phi_k = rho_k * self._green_k[:, :, :Mh]
+                ax_r  = np.fft.irfftn((-1j * self._kx[:, :, :Mh]) * phi_k, s=(M, M, M))
+                ay_r  = np.fft.irfftn((-1j * self._ky[:, :, :Mh]) * phi_k, s=(M, M, M))
+                az_r  = np.fft.irfftn((-1j * self._kz[:, :, :Mh]) * phi_k, s=(M, M, M))
+        else:
+            # CPU-Pfad: scipy.fft (multithreaded, workers=-1) oder numpy.fft
+            assert self._green_k is not None
+            rho_k = _rfftn(self._rho, **_FFT_KW)  # type: ignore[call-arg]
+            phi_k = rho_k * self._green_k[:, :, :Mh]
+            ax_r  = _irfftn((-1j * self._kx[:, :, :Mh]) * phi_k, s=(M, M, M), **_FFT_KW)  # type: ignore[call-arg]
+            ay_r  = _irfftn((-1j * self._ky[:, :, :Mh]) * phi_k, s=(M, M, M), **_FFT_KW)  # type: ignore[call-arg]
+            az_r  = _irfftn((-1j * self._kz[:, :, :Mh]) * phi_k, s=(M, M, M), **_FFT_KW)  # type: ignore[call-arg]
 
         # 6. CIC Force-Interpolation → Partikel
         if self._accel_out is None or self._accel_out.shape[0] != N:

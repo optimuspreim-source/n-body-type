@@ -34,11 +34,11 @@ Architektur
 import time
 import threading
 import numpy as np
-from vispy import scene, app
+from vispy import scene, app  # type: ignore[import-untyped]
 
 from engine.physics.BarnesHutNumba import nbody_step, make_tree_arrays, warmup as bh_warmup
 from engine.physics.FastMultipole  import fmm_step, make_fmm_arrays, warmup_fmm
-from engine.physics.ParticleMesh   import ParticleMeshSolver
+from engine.physics.ParticleMesh   import ParticleMeshSolver, GPU_AVAILABLE
 from engine.physics.MergerKernel   import apply_mergers, apply_agn_jets, compute_stats
 from engine.physics.DarkMatterHalo  import NFWHalo, DarkMatterSystem
 from engine.physics.StellarFeedback import StellarFeedback
@@ -112,13 +112,6 @@ class GalaxySimVispyViewer:
         self._disk_p32 = np.empty((N_disk, 3), dtype=np.float32)  # Pos-Buffer (wiederverwendet)
         self._disk_col_dirty = True   # True = Farben müssen erneut an GPU gesendet werden
 
-        # ── Tiefenskalierung + additiver Glow-Schicht Puffer ─────────────────
-        self._disk_sz_base    = self._disk_sz.copy()            # unveränderl. Basis für Tiefenmod.
-        self._disk_col_render = np.empty_like(self._disk_col)   # Render-Puffer (kein Alloc/Frame)
-        self._glow_col        = np.empty((N_disk, 4), dtype=np.float32)
-        self._glow_sz_base    = np.maximum(4.0, self._disk_sz * 4.0).astype(np.float32)
-        self._glow_sz         = self._glow_sz_base.copy()
-
         # Per-Partikel Softening:  SMBH stark (eps_bh), Sterne leicht (eps_star)
         eps_bh   = 6.0    # Starkes Softening für Schwarze Löcher → verhindert Singularitäten bei Passage
         eps_star = 1.2    # Leichtes Softening für Ring-/Scheiben-Partikel → erhält Orbitalstruktur
@@ -166,10 +159,18 @@ class GalaxySimVispyViewer:
             self._max_nodes  = int(N * 5)
             self._tree       = make_tree_arrays(self._max_nodes)
             self._fmm_arrays = make_fmm_arrays(self._max_nodes)
-            self._pm         = ParticleMeshSolver(
-                N_grid=128, box_size=3000., G=G, eps=eps)
-            # Standard-Backend
-            self.backend = _BACKEND_BH
+
+            # GPU verfügbar: größeres Gitter + PM als Standard-Backend
+            _pm_grid = 256 if GPU_AVAILABLE else 128
+            self._pm = ParticleMeshSolver(
+                N_grid=_pm_grid, box_size=3000., G=G, eps=eps)
+
+            # Standard-Backend: GPU-PM wenn verfügbar, sonst Barnes-Hut (CPU)
+            if GPU_AVAILABLE:
+                self.backend = _BACKEND_PM
+                print('[GPU] CuPy-Beschleunigung erkannt – PM-Backend (256³) gewählt')
+            else:
+                self.backend = _BACKEND_BH
 
             # Alle Backends vorab JIT-kompilieren
             bh_warmup()
@@ -192,7 +193,7 @@ class GalaxySimVispyViewer:
         self.canvas = scene.SceneCanvas(
             keys='interactive', show=True, bgcolor='black',
             title=f'N-Body  {N} Partikel  –  SPACE  +/-  R  T  M  B')
-        self.canvas.events.key_press.connect(self._on_key)
+        self.canvas.events.key_press.connect(self._on_key)  # type: ignore[attr-defined]
 
         vp = self.canvas.central_widget.add_view()
         self.view = vp
@@ -202,50 +203,41 @@ class GalaxySimVispyViewer:
         self.view.camera = scene.cameras.TurntableCamera(
             fov=52, distance=_cam_dist, elevation=28, azimuth=35)
 
-        # ── Scatter 0: Disk-Stern-Glow (additives Blending → Nebel/Bloom-Effekt) ──
-        self._upd32()
-        self._rebuild_glow_colors()
-        self.sc_glow_disk = scene.visuals.Markers()
-        self.sc_glow_disk.set_data(
-            self._disk_p32,
-            face_color=self._glow_col,
-            size=self._glow_sz,
-            edge_width=0)
-        self.sc_glow_disk.set_gl_state('additive', depth_test=False)
-        self.view.add(self.sc_glow_disk)
-
         # ── Scatter 1: alle Disk-Sterne ──────────────────────────────────
-        self.sc_disk = scene.visuals.Markers()
+        self._upd32()
+        self.sc_disk = scene.visuals.Markers()  # type: ignore[attr-defined]
         self.sc_disk.set_data(
             self._disk_p32,
             face_color=self._disk_col,
             size=self._disk_sz,
             edge_width=0)
-        self.sc_disk.antialias = 1.5
         self._disk_col_dirty = False
         self.view.add(self.sc_disk)
 
         # ── Scatter 2: SMBH-Schatten (dunkle, große Marker) ─────────────
-        self.sc_shadow = scene.visuals.Markers()
+        self.sc_shadow = scene.visuals.Markers()  # type: ignore[attr-defined]
         self.view.add(self.sc_shadow)
 
         # ── Scatter 3: Photonen-Ring-Glow (leuchtend, noch größer) ──────
-        self.sc_glow = scene.visuals.Markers()
-        self.sc_glow.set_gl_state('additive', depth_test=False)
+        self.sc_glow = scene.visuals.Markers()  # type: ignore[attr-defined]
         self.view.add(self.sc_glow)
 
         self._update_bh_visuals()
 
-        # ── Physik-Thread: Render (~60 FPS) vollständig von Physik entkoppelt ──
-        # Numba-JIT-Kernel (BH, FMM) geben die Python-GIL frei → echter Parallelismus.
-        _nd = len(self._disk_idx)
-        self._phys_disk_p32   = np.empty((_nd, 3), dtype=np.float32)  # Physik schreibt hier
-        self._render_disk_p32 = self._disk_p32.copy()                  # Puffer unter Lock geteilt
-        self._rlock       = threading.Lock()
-        self._rsnap_new   = False
-        self._rsnap_bh    = None                  # (pos32, sz_s, sz_g) oder None
-        self._rsnap_stats = self._stats           # (frag, E, nact)
-        self._rsnap_zval  = 0.0
+        # ── Physik-Daemon-Thread ──────────────────────────────────────────
+        # Physik läuft vollständig entkoppelt vom Render-Timer.
+        # Doppelbuffer: _phys_disk_p32 wird vom Physik-Thread beschrieben,
+        # _render_disk_p32 wird vom Render-Thread gelesen (unter Lock getauscht).
+        N_disk = len(self._disk_idx)
+        self._phys_disk_p32   = np.empty((N_disk, 3), dtype=np.float32)
+        self._render_disk_p32 = self._disk_p32.copy()
+        self._rlock      = threading.Lock()
+        self._snap_ready = False          # neues Snapshot verfügbar?
+        self._rsnap_bh   = None           # BH-Snapshot für Render-Thread
+        self._rsnap_col  = self._disk_col.copy()   # Farb-Snapshot
+        self._rsnap_dirty = False          # Farben haben sich geändert
+        self._rsnap_ms   = 0.0             # letzte Physik-Zeit [ms]
+
         self._phys_running = True
         self._phys_thread  = threading.Thread(
             target=self._phys_loop, name='phys', daemon=True)
@@ -280,12 +272,14 @@ class GalaxySimVispyViewer:
 
             elif self.backend == _BACKEND_PM:
                 # PM-only: gut für großskalige Dynamik, aber schlechte Auflösung nahe BHs
+                assert self._pm is not None
                 self.pos, self.vel = self._pm.step(
                     self.pos, self.vel, self.mass, self.dt)
 
             elif self.backend == _BACKEND_P3M:
                 # P3M: PM für Fernfeld + BH für Nahfeld-Korrektur
                 # Fernfeld: PM-Beschleunigung berechnen
+                assert self._pm is not None
                 pm_accel = self._pm.compute_accel(self.pos, self.mass)
                 # Nahfeld-Korrektur: BH Schritt durchführen, dann PM hinzuaddieren
                 self.pos, self.vel = nbody_step(
@@ -346,22 +340,21 @@ class GalaxySimVispyViewer:
         self.sc_shadow.set_data(p32, face_color=col_s, size=sz_s, edge_width=0)
         self.sc_glow  .set_data(p32, face_color=col_g, size=sz_g, edge_width=0)
 
-    # ── Physik-Hintergrundthread ──────────────────────────────────────────
-    # Numba-JIT-Kernel (BH, FMM) geben die Python-GIL frei → echter Parallelismus
-    # zwischen Physik-Thread und Render-Thread (vispy event loop).
+    # ── Physik-Daemon-Thread ────────────────────────────────────────────
 
     def _phys_loop(self):
-        """Physik kontinuierlich im Daemon-Thread; Render läuft unabhängig bei ~60 FPS."""
-        phys_fn = 0
+        """Läuft in Daemon-Thread, entkoppelt von vispy-Render-Loop."""
+        phys_frame = 0
         while self._phys_running:
             if self.paused:
-                time.sleep(0.005)
+                time.sleep(0.01)
                 continue
 
-            # ── N-Body-Schritte + Merger ──────────────────────────────────
+            t0 = time.perf_counter()
             for step in range(self.spf):
                 self._step()
-                if (phys_fn * self.spf + step) % _MERGER_EVERY == 0:
+                step_n = phys_frame * self.spf + step
+                if step_n % _MERGER_EVERY == 0:
                     _nbhm, _nacc, acc_mass = apply_mergers(
                         self.pos, self.vel, self.mass,
                         self.bh_idx, _MERGE_BH_R, _ACCRETE_R)
@@ -371,99 +364,96 @@ class GalaxySimVispyViewer:
                             self.pos, self.vel, self.mass,
                             jet_threshold=_JET_THRESHOLD, G=self.G)
                         self._stats_agn += n_jet
+            ms = (time.perf_counter() - t0) * 1e3
 
-            # ── Statistiken ────────────────────────────────────────────────
-            if phys_fn % _STATS_EVERY == 0:
+            # Positionen → Physik-Buffer (kein Lock nötig, nur Physik-Thread schreibt)
+            self._upd32_phys()
+
+            # Farben bei Metallizitäts-Modus vorbereiten
+            col_dirty = False
+            col_snap  = None
+            if self._color_mode == 'metallicity':
+                if self._disk_col_dirty or (phys_frame - self._met_col_age >= 5):
+                    met_col = self._feedback.metallicity_colors()
+                    np.copyto(self._disk_col, met_col[self._disk_idx], casting='unsafe')
+                    self._met_col_age  = phys_frame
+                    col_dirty = True
+            if phys_frame % _STATS_EVERY == 0:
                 self._stats = compute_stats(self.pos, self.vel, self.mass, self.G)
-            frag, Esys, nact = self._stats
-            zval = float(self._feedback.Z[~self.bh_m & (self.mass > 0.)].mean()) \
-                   if nact > 3 else 0.
 
-            # ── BH-Visualdaten vorbereiten ─────────────────────────────────
-            bh_data = None
-            if phys_fn % _BH_VIS_EVERY == 0:
-                abh = [i for i in self.bh_idx if self.mass[i] > 0.]
-                if abh:
-                    sz_s = np.array(
-                        [max(10., min(0.018 * float(self.mass[i])**.55, 32.))
-                         for i in abh], dtype=np.float32)
-                    bh_data = (self.pos[abh].astype(np.float32).copy(),
-                               sz_s, sz_s * 1.75)
+            # BH-Snapshot vorbereiten
+            abh = [i for i in self.bh_idx if self.mass[i] > 0.]
+            if abh:
+                bh_snap = self._p32[abh].copy()
+                sz_s = np.array([max(10., min(0.018 * float(self.mass[i])**.55, 32.))
+                                 for i in abh], dtype=np.float32)
+            else:
+                bh_snap = None
+                sz_s    = None
 
-            # ── Render-Snapshot: float64→float32, dann kurz locken ─────────
-            np.copyto(self._p32, self.pos, casting='unsafe')
-            np.take(self._p32, self._disk_idx, axis=0, out=self._phys_disk_p32)
+            # Snapshot an Render-Thread übergeben (sehr kurze Lock-Zeit)
             with self._rlock:
                 np.copyto(self._render_disk_p32, self._phys_disk_p32)
-                if bh_data is not None:
-                    self._rsnap_bh = bh_data
-                self._rsnap_stats = (frag, Esys, nact)
-                self._rsnap_zval  = zval
-                self._rsnap_new   = True
-            phys_fn += 1
+                self._rsnap_bh    = (bh_snap, sz_s) if bh_snap is not None else None
+                if col_dirty:
+                    self._rsnap_col   = self._disk_col.copy()
+                    self._rsnap_dirty = True
+                self._snap_ready  = True
+                self._rsnap_ms    = ms
 
-    # ── Timer-Callback (Render-Thread, ~60 FPS) ───────────────────────────
+            phys_frame += 1
+            self._disk_col_dirty = False
+
+    def _upd32_phys(self):
+        """float64 → float32, schreibt in Physik-seitigen Buffer (kein Lock)."""
+        np.copyto(self._p32, self.pos, casting='unsafe')
+        np.take(self._p32, self._disk_idx, axis=0, out=self._phys_disk_p32)
+
+    # ── Timer-Callback (nur Rendering, keine Physik) ─────────────────────
 
     def _on_timer(self, event):
-        # Render-Snapshot vom Physik-Thread übernehmen (Lock nur für kurzen copyto)
+        if not self._snap_ready:
+            return
+
+        # Snapshot unter Lock abholen
         with self._rlock:
-            if self._rsnap_new:
-                np.copyto(self._disk_p32, self._render_disk_p32)
-                self._rsnap_new = False
-            bh_data = self._rsnap_bh
-            stats   = self._rsnap_stats
-            zval    = self._rsnap_zval
+            np.copyto(self._disk_p32, self._render_disk_p32)
+            bh_snap   = self._rsnap_bh
+            col_dirty = self._rsnap_dirty
+            if col_dirty:
+                np.copyto(self._disk_col, self._rsnap_col)
+                self._rsnap_dirty = False
+            ms        = self._rsnap_ms
+            self._snap_ready = False
 
-        # Metallizitäts-Farbmodus
-        if self._color_mode == 'metallicity':
-            if self._disk_col_dirty or (self.frame_n - self._met_col_age >= 5):
-                met_col = self._feedback.metallicity_colors()
-                np.copyto(self._disk_col, met_col[self._disk_idx], casting='unsafe')
-                self._met_col_age    = self.frame_n
-                self._disk_col_dirty = True
+        fps = 1e3 / ms if ms > 0. else 0.
 
-        # ── Tiefenskalierung (Kamera-Raumprojektion) ─────────────────────
-        _az  = np.radians(float(self.view.camera.azimuth))
-        _el  = np.radians(float(self.view.camera.elevation))
-        _cam = np.array([np.cos(_el) * np.cos(_az),
-                         np.cos(_el) * np.sin(_az),
-                         np.sin(_el)], dtype=np.float32)
-        _d  = self._disk_p32 @ _cam
-        _dt = (_d - _d.min()) / max(float(_d.max() - _d.min()), 1e-6)
-
-        np.multiply(self._disk_sz_base, 0.85 + 0.30 * _dt, out=self._disk_sz)
-        np.copyto(self._disk_col_render, self._disk_col)
-        self._disk_col_render[:, 3] *= 0.60 + 0.40 * _dt
-
-        if self._disk_col_dirty:
-            self._rebuild_glow_colors()
-        np.multiply(self._glow_sz_base, 0.85 + 0.30 * _dt, out=self._glow_sz)
-        self.sc_glow_disk.set_data(
-            self._disk_p32, face_color=self._glow_col,
-            size=self._glow_sz, edge_width=0)
+        # Disk-Scatter aktualisieren
         self.sc_disk.set_data(
             self._disk_p32,
-            face_color=self._disk_col_render,
+            face_color=self._disk_col,
             size=self._disk_sz,
             edge_width=0)
-        self._disk_col_dirty = False
 
-        # ── SMBH-Visuals (aus Physik-Snapshot) ────────────────────────────
-        if bh_data is not None:
-            pos32, sz_s, sz_g = bh_data
-            col_s = np.tile([0.02, 0.02, 0.04, 1.00], (len(sz_s), 1)).astype(np.float32)
-            col_g = np.tile([1.00, 0.68, 0.12, 0.18], (len(sz_s), 1)).astype(np.float32)
-            self.sc_shadow.set_data(pos32, face_color=col_s, size=sz_s, edge_width=0)
-            self.sc_glow  .set_data(pos32, face_color=col_g, size=sz_g, edge_width=0)
+        # SMBH-Visuals
+        if bh_snap is not None:
+            bh_pos, sz_s = bh_snap
+            assert sz_s is not None
+            sz_g   = sz_s * 1.75
+            col_s  = np.tile([0.02, 0.02, 0.04, 1.00], (len(sz_s), 1)).astype(np.float32)
+            col_g  = np.tile([1.00, 0.68, 0.12, 0.18], (len(sz_s), 1)).astype(np.float32)
+            self.sc_shadow.set_data(bh_pos, face_color=col_s, size=sz_s, edge_width=0)
+            self.sc_glow  .set_data(bh_pos, face_color=col_g, size=sz_g, edge_width=0)
 
-        # ── Fenstertitel ───────────────────────────────────────────────────
-        frag, Esys, nact = stats
+        # Titelzeile
+        frag, Esys, nact = self._stats
+        Z_mean = float(self._feedback.Z[~self.bh_m & (self.mass > 0.)].mean()) if nact > 3 else 0.
         dm_str   = '★DM' if self._dm else ''
-        mode_str = '[Z]'  if self._color_mode == 'metallicity' else ''
+        mode_str = '[Z]' if self._color_mode == 'metallicity' else ''
         self.canvas.title = (
             f'N-Body {self.N}  akt:{nact} {dm_str}{mode_str}  |  '
-            f'[{self.backend}]  |  '
-            f'SN:{self._total_sn}  <Z>:{zval:.3f}  '
+            f'{fps:.0f} FPS  {ms:.0f}ms  [{self.backend}]  |  '
+            f'SN:{self._total_sn}  <Z>:{Z_mean:.3f}  '
             f'Zerlg:{frag*100:.1f}%  |  '
             f'dt={self.dt:.2f}   SPACE +/- R T M B'
         )
@@ -471,15 +461,6 @@ class GalaxySimVispyViewer:
         self.frame_n += 1
 
     # ── Hilfsfunktionen ──────────────────────────────────────────────────
-
-    def _rebuild_glow_colors(self):
-        """Glow-Farben aus aktuellen Disk-Farben ableiten (aufgehellt, sehr transparent).
-
-        Mit additivem Blending akkumuliert sich das Glow-Licht in dichten Regionen
-        (Galaxienkerne, Cluster) zu leuchtenden Flächen – sparse Gebiete bleiben dunkel.
-        """
-        np.clip(self._disk_col[:, :3] * 1.6, 0., 1., out=self._glow_col[:, :3])
-        self._glow_col[:, 3] = 0.045
 
     def _upd32(self):
         """float64 → float32 in-place + Disk-Positionen gecacht (kein Heap-Alloc)."""
@@ -514,7 +495,8 @@ class GalaxySimVispyViewer:
             # Farbmodus umschalten: Standard ↔ Metallizität
             if self._color_mode == 'default':
                 self._color_mode = 'metallicity'
-                self._met_col_age = -1   # Sofortige Aktualisierung erzwingen
+                self._met_col_age    = -1     # Sofortige Aktualisierung erzwingen
+                self._disk_col_dirty = True   # erste Farb-Berechnung garantieren
                 print('  Farbmodus: METALLIZITÄT  (blau=arm, gelb=solar, weiß=reich)')
             else:
                 self._color_mode = 'default'

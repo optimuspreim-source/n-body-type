@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 def _run_launcher():
     """Qt-Launcher starten (Standardpfad)."""
-    import vispy
+    import vispy  # type: ignore
     vispy.use('pyqt5')
 
     from PyQt5.QtWidgets import QApplication
