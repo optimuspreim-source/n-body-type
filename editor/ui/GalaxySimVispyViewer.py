@@ -96,7 +96,7 @@ class GalaxySimVispyViewer:
             dtype=np.float32)
         self._r_col_default = self.r_col.copy()   # Backup für Farbmodus-Reset
         self.r_sz  = np.array(
-            [s.get('render_size', 1.5) for s in all_stars],
+            [s.get('render_size', 0.6) for s in all_stars],
             dtype=np.float32)
 
         # Disk-Maske: alles außer BHs (BHs haben render_size~0.1 → unsichtbar
@@ -228,9 +228,16 @@ class GalaxySimVispyViewer:
         # Physik läuft vollständig entkoppelt vom Render-Timer.
         # Doppelbuffer: _phys_disk_p32 wird vom Physik-Thread beschrieben,
         # _render_disk_p32 wird vom Render-Thread gelesen (unter Lock getauscht).
+        # _render_disk_vel32 ermöglicht lineare Positions-Interpolation zwischen
+        # Physik-Frames für weiches 60fps-Rendering unabhängig von der Physikrate.
         N_disk = len(self._disk_idx)
-        self._phys_disk_p32   = np.empty((N_disk, 3), dtype=np.float32)
-        self._render_disk_p32 = self._disk_p32.copy()
+        self._phys_disk_p32    = np.empty((N_disk, 3), dtype=np.float32)
+        self._render_disk_p32  = self._disk_p32.copy()
+        self._phys_disk_vel32  = np.zeros((N_disk, 3), dtype=np.float32)
+        self._render_disk_vel32 = np.zeros((N_disk, 3), dtype=np.float32)
+        self._disk_vel_render  = np.zeros((N_disk, 3), dtype=np.float32)
+        self._disk_p32_interp  = self._disk_p32.copy()   # interpolierte Positionen für Render
+        self._snap_wall_time   = 0.0                       # Wanduhr-Zeit des letzten Snapshots
         self._rlock      = threading.Lock()
         self._snap_ready = False          # neues Snapshot verfügbar?
         self._rsnap_bh   = None           # BH-Snapshot für Render-Thread
@@ -349,22 +356,28 @@ class GalaxySimVispyViewer:
             if self.paused:
                 time.sleep(0.01)
                 continue
-
-            t0 = time.perf_counter()
-            for step in range(self.spf):
-                self._step()
-                step_n = phys_frame * self.spf + step
-                if step_n % _MERGER_EVERY == 0:
-                    _nbhm, _nacc, acc_mass = apply_mergers(
-                        self.pos, self.vel, self.mass,
-                        self.bh_idx, _MERGE_BH_R, _ACCRETE_R)
-                    if acc_mass:
-                        n_jet = apply_agn_jets(
-                            self.bh_idx, acc_mass,
+            try:
+                t0 = time.perf_counter()
+                for step in range(self.spf):
+                    self._step()
+                    step_n = phys_frame * self.spf + step
+                    if step_n % _MERGER_EVERY == 0:
+                        _nbhm, _nacc, acc_mass = apply_mergers(
                             self.pos, self.vel, self.mass,
-                            jet_threshold=_JET_THRESHOLD, G=self.G)
-                        self._stats_agn += n_jet
-            ms = (time.perf_counter() - t0) * 1e3
+                            self.bh_idx, _MERGE_BH_R, _ACCRETE_R)
+                        if acc_mass:
+                            n_jet = apply_agn_jets(
+                                self.bh_idx, acc_mass,
+                                self.pos, self.vel, self.mass,
+                                jet_threshold=_JET_THRESHOLD, G=self.G)
+                            self._stats_agn += n_jet
+                ms = (time.perf_counter() - t0) * 1e3
+            except Exception as exc:
+                import traceback
+                print(f'[PhysThread] FEHLER in Schritt {phys_frame}:\n{traceback.format_exc()}')
+                time.sleep(0.1)
+                phys_frame += 1
+                continue
 
             # Positionen → Physik-Buffer (kein Lock nötig, nur Physik-Thread schreibt)
             self._upd32_phys()
@@ -394,6 +407,8 @@ class GalaxySimVispyViewer:
             # Snapshot an Render-Thread übergeben (sehr kurze Lock-Zeit)
             with self._rlock:
                 np.copyto(self._render_disk_p32, self._phys_disk_p32)
+                np.copyto(self._render_disk_vel32, self._phys_disk_vel32)
+                self._snap_wall_time = time.perf_counter()
                 self._rsnap_bh    = (bh_snap, sz_s) if bh_snap is not None else None
                 if col_dirty:
                     self._rsnap_col   = self._disk_col.copy()
@@ -408,6 +423,8 @@ class GalaxySimVispyViewer:
         """float64 → float32, schreibt in Physik-seitigen Buffer (kein Lock)."""
         np.copyto(self._p32, self.pos, casting='unsafe')
         np.take(self._p32, self._disk_idx, axis=0, out=self._phys_disk_p32)
+        # Geschwindigkeiten für Interpolation mitschreiben
+        self._phys_disk_vel32[:] = self.vel[self._disk_idx]
 
     # ── Timer-Callback (nur Rendering, keine Physik) ─────────────────────
 
@@ -418,6 +435,8 @@ class GalaxySimVispyViewer:
         # Snapshot unter Lock abholen
         with self._rlock:
             np.copyto(self._disk_p32, self._render_disk_p32)
+            np.copyto(self._disk_vel_render, self._render_disk_vel32)
+            snap_time = self._snap_wall_time
             bh_snap   = self._rsnap_bh
             col_dirty = self._rsnap_dirty
             if col_dirty:
@@ -428,9 +447,16 @@ class GalaxySimVispyViewer:
 
         fps = 1e3 / ms if ms > 0. else 0.
 
+        # Lineare Interpolation der Positionen zwischen Physik-Frames:
+        # pos_render = pos_snap + vel_snap * dt_seit_snapshot
+        # Begrenzt auf max. 1 Physik-Schritt (keine Überschreitung bei langem Warten).
+        dt_interp = float(np.clip(time.perf_counter() - snap_time, 0., ms * 8e-4))  # max ~80% Schrittzeit
+        np.add(self._disk_p32, self._disk_vel_render * dt_interp,
+               out=self._disk_p32_interp, casting='unsafe')
+
         # Disk-Scatter aktualisieren
         self.sc_disk.set_data(
-            self._disk_p32,
+            self._disk_p32_interp,
             face_color=self._disk_col,
             size=self._disk_sz,
             edge_width=0)
