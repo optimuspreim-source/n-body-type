@@ -42,8 +42,9 @@ except Exception:
 
 # ─ scipy.fft: multithreaded FFT (3–8× schneller als numpy.fft, nutzt alle CPU-Kerne) ─
 try:
+    import os as _os
     from scipy.fft import rfftn as _rfftn, irfftn as _irfftn  # type: ignore
-    _FFT_KW = {'workers': -1}   # alle CPU-Kerne nutzen
+    _FFT_KW = {'workers': max(2, (_os.cpu_count() or 4) // 2)}   # halbe Kernzahl
 except ImportError:
     _rfftn  = np.fft.rfftn
     _irfftn = np.fft.irfftn

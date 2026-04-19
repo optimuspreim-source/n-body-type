@@ -263,8 +263,15 @@ Tastatursteuerung (während der Simulation):
   R          dt auf Startwert zurücksetzen
   T          Statistik in Konsole ausgeben
   M          Farbmodus: Standard ↔ Metallizität
+  B          Backend wechseln (BH → FMM → PM → P3M → Python-BH)
+  S          Snapshot als PNG speichern
   Maus       Kamera drehen (linke Taste)
   Scroll     Zoom
+
+Schnellstart-Presets (Menü Datei):
+  Ctrl+N     Standard-Simulation (N Galaxienscheiben)
+  Ctrl+K     2 Galaxien kollidieren (physikalisch fundiert)
+  Ctrl+J     N Spiralgalaxien (schnell, kein DM)
 
 Legende (Farbmodi):
   Standard     Galaxienfarbe pro Scheibe
@@ -338,6 +345,18 @@ class SimulationLauncher(QMainWindow):
         act_new.setShortcut('Ctrl+N')
         act_new.triggered.connect(self._start_simulation)
         file_menu.addAction(act_new)
+
+        # Schnellstart-Presets
+        file_menu.addSeparator()
+        act_collide = QAction('Schnellstart: 2 Galaxien kollidieren', self)
+        act_collide.setShortcut('Ctrl+K')
+        act_collide.triggered.connect(self._start_colliding_galaxies)
+        file_menu.addAction(act_collide)
+
+        act_spiral = QAction('Schnellstart: Spiralgalaxien (schnell)', self)
+        act_spiral.setShortcut('Ctrl+J')
+        act_spiral.triggered.connect(self._start_spiral_galaxies)
+        file_menu.addAction(act_spiral)
 
         act_reset = QAction('Parameter zurücksetzen', self)
         act_reset.setShortcut('Ctrl+R')
@@ -449,6 +468,72 @@ class SimulationLauncher(QMainWindow):
     # ─────────────────────────────────────────────────────────────────────────
     # Slot-Handler
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _start_colliding_galaxies(self):
+        """Schnellstart: Zwei kollidierende Galaxienscheiben (Ctrl+K)."""
+        from assets.presets.colliding_galaxies import generate_colliding_galaxies
+        from editor.ui.GalaxySimVispyViewer import GalaxySimVispyViewer
+        params = self._ctrl.get_parameters()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.statusBar().showMessage('  Kollisions-Preset wird generiert …')
+        QApplication.processEvents()
+        try:
+            galaxies, dm_cfgs = generate_colliding_galaxies(
+                stars_per_galaxy = max(100, int(round(params.get('n_stars', 50_000))) // 2),
+                disk_radius      = float(params.get('disk_radius', 80.0)),
+                bh_mass          = float(params.get('bh_mass', 14_000.0)),
+                dm_enabled       = bool(params.get('dm_enabled', True)),
+                dm_M_vir         = float(params.get('dm_M_vir', 520_000.0)),
+                dm_r_s           = float(params.get('dm_r_s', 180.0)),
+                dm_c             = float(params.get('dm_c', 12.0)),
+                G                = float(params.get('G', 1.0)),
+                eps_star         = float(params.get('eps_star', 1.2)),
+                eps_bh           = float(params.get('eps_bh', 6.0)),
+            )
+            viewer = GalaxySimVispyViewer(
+                galaxies,
+                dm_halo_configs = dm_cfgs if params.get('dm_enabled', True) else None,
+                dt              = float(params.get('dt', 0.7)),
+                G               = float(params.get('G', 1.0)),
+                eps             = float(params.get('eps_star', 1.2)),
+                theta           = float(params.get('theta', 0.65)),
+                steps_per_frame = max(1, int(round(params.get('steps_per_frame', 1)))),
+            )
+            self._viewers.append(viewer)
+            self.statusBar().showMessage('  Kollisions-Simulation gestartet.')
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _start_spiral_galaxies(self):
+        """Schnellstart: N Spiralgalaxien (einfaches Preset, kein DM)  (Ctrl+J)."""
+        from assets.presets.spiral_galaxy import build_spiral_galaxies_preset
+        from editor.ui.GalaxySimVispyViewer import GalaxySimVispyViewer
+        params = self._ctrl.get_parameters()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.statusBar().showMessage('  Spiral-Preset wird generiert …')
+        QApplication.processEvents()
+        try:
+            galaxies, _ = build_spiral_galaxies_preset(
+                n_galaxies  = max(2, int(round(params.get('n_galaxies', 3)))),
+                n_stars     = max(100, int(round(params.get('n_stars', 50_000)))),
+                disk_radius = float(params.get('disk_radius', 80.0)),
+                sep         = float(params.get('sep', 750.0)),
+                G           = float(params.get('G', 1.0)),
+                bh_mass     = float(params.get('bh_mass', 12_000.0)),
+            )
+            viewer = GalaxySimVispyViewer(
+                galaxies,
+                dm_halo_configs = None,    # kein DM für schnelles Preset
+                dt              = float(params.get('dt', 0.7)),
+                G               = float(params.get('G', 1.0)),
+                eps             = float(params.get('eps_star', 1.2)),
+                theta           = float(params.get('theta', 0.65)),
+                steps_per_frame = max(1, int(round(params.get('steps_per_frame', 1)))),
+            )
+            self._viewers.append(viewer)
+            self.statusBar().showMessage('  Spiral-Simulation gestartet.')
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _on_params_changed(self, params: dict):
         """Aktualisiert das Info-Panel live bei jeder Parameteränderung."""

@@ -33,8 +33,15 @@ Architektur
 """
 import time
 import threading
+import os
 import numpy as np
 from vispy import scene, app  # type: ignore[import-untyped]
+
+# ── Numba Thread-Budget: maximal halbe Kernzahl für Physik ─────────────────
+# Lässt dem OS, dem Render-Thread und vispy die andere Hälfte.
+import numba   # type: ignore[import-untyped]
+_PHYS_CORES = max(2, (os.cpu_count() or 4) // 2)
+numba.set_num_threads(_PHYS_CORES)
 
 from engine.physics.BarnesHutNumba import nbody_step, make_tree_arrays, warmup as bh_warmup
 from engine.physics.FastMultipole  import fmm_step, make_fmm_arrays, warmup_fmm
@@ -58,6 +65,7 @@ _BACKEND_BH    = 'BH'     # Barnes-Hut (Standard, O(N log N))
 _BACKEND_FMM   = 'FMM'   # Fast Multipole Method (O(N), Quadrupol)
 _BACKEND_PM    = 'PM'    # Particle Mesh (O(N + M³ log M), Fernfeld)
 _BACKEND_P3M   = 'P3M'  # Particle-Particle + Particle-Mesh (PM Fernfeld + BH Nahfeld)
+_BACKEND_PY    = 'PY'   # Pure-Python BH (Fallback für N < 300 / Diagnose)
 
 
 class GalaxySimVispyViewer:
@@ -96,7 +104,7 @@ class GalaxySimVispyViewer:
             dtype=np.float32)
         self._r_col_default = self.r_col.copy()   # Backup für Farbmodus-Reset
         self.r_sz  = np.array(
-            [s.get('render_size', 0.6) for s in all_stars],
+            [s.get('render_size', 0.08) for s in all_stars],
             dtype=np.float32)
 
         # Disk-Maske: alles außer BHs (BHs haben render_size~0.1 → unsichtbar
@@ -237,6 +245,7 @@ class GalaxySimVispyViewer:
         self._render_disk_vel32 = np.zeros((N_disk, 3), dtype=np.float32)
         self._disk_vel_render  = np.zeros((N_disk, 3), dtype=np.float32)
         self._disk_p32_interp  = self._disk_p32.copy()   # interpolierte Positionen für Render
+        self._vel_tmp          = np.empty((N_disk, 3), dtype=np.float32)  # Scratch für vel*dt
         self._snap_wall_time   = 0.0                       # Wanduhr-Zeit des letzten Snapshots
         self._rlock      = threading.Lock()
         self._snap_ready = False          # neues Snapshot verfügbar?
@@ -244,6 +253,16 @@ class GalaxySimVispyViewer:
         self._rsnap_col  = self._disk_col.copy()   # Farb-Snapshot
         self._rsnap_dirty = False          # Farben haben sich geändert
         self._rsnap_ms   = 0.0             # letzte Physik-Zeit [ms]
+
+        # Render-seitiger Zustand (überlebt zwischen Snapshots für Interpolation)
+        self._last_snap_time = 0.0         # Wanduhr-Zeitpunkt des letzten Snapshots
+        self._last_bh_snap   = None        # letztes BH-Snapshot
+        self._last_phys_ms   = 0.0         # letzte Physik-Schrittzeit [ms]
+
+        # BH-Farb-Arrays vorab allozieren (max. so viele BHs wie es gibt)
+        _max_bh = max(len(self.bh_idx), 1)
+        self._bh_col_s = np.tile([0.02, 0.02, 0.04, 1.00], (_max_bh, 1)).astype(np.float32)
+        self._bh_col_g = np.tile([1.00, 0.68, 0.12, 0.18], (_max_bh, 1)).astype(np.float32)
 
         self._phys_running = True
         self._phys_thread  = threading.Thread(
@@ -296,6 +315,18 @@ class GalaxySimVispyViewer:
                 # PM-Korrektur zusätzlich applizieren (Kic velocities additiv)
                 active = self.mass > 0.
                 self.vel[active] += pm_accel[active] * self.dt * 0.5   # halber Schritt (bereits integriert)
+
+            elif self.backend == _BACKEND_PY:
+                # Pure-Python BH Fallback (kein Numba JIT, gut für N < 300 / Debugging)
+                from engine.physics.BarnesHut3D import BarnesHut3D as _BH3D
+                acc = _BH3D.solve(
+                    self.pos, self.mass,
+                    G=self.G, eps=float(np.sqrt(self.eps2_arr.mean())), theta=self.theta,
+                    workers=2,
+                )
+                active = self.mass > 0.
+                self.pos[active] += self.vel[active] * self.dt + 0.5 * acc[active] * self.dt**2
+                self.vel[active] += acc[active] * self.dt
         else:
             # Velocity Verlet (Leapfrog) O(N²)
             self.pos += self.vel * self.dt
@@ -352,10 +383,17 @@ class GalaxySimVispyViewer:
     def _phys_loop(self):
         """Läuft in Daemon-Thread, entkoppelt von vispy-Render-Loop."""
         phys_frame = 0
+        _MIN_SLEEP = 0.002   # 2ms Pause – gibt GIL frei für Render-Thread
         while self._phys_running:
             if self.paused:
-                time.sleep(0.01)
+                time.sleep(0.02)
                 continue
+
+            # Warte falls Render-Thread den letzten Snapshot noch nicht gelesen hat
+            if self._snap_ready:
+                time.sleep(0.001)
+                continue
+
             try:
                 t0 = time.perf_counter()
                 for step in range(self.spf):
@@ -419,6 +457,9 @@ class GalaxySimVispyViewer:
             phys_frame += 1
             self._disk_col_dirty = False
 
+            # Obligatorische Pause – gibt OS + Render-Thread Luft
+            time.sleep(_MIN_SLEEP)
+
     def _upd32_phys(self):
         """float64 → float32, schreibt in Physik-seitigen Buffer (kein Lock)."""
         np.copyto(self._p32, self.pos, casting='unsafe')
@@ -429,60 +470,70 @@ class GalaxySimVispyViewer:
     # ── Timer-Callback (nur Rendering, keine Physik) ─────────────────────
 
     def _on_timer(self, event):
-        if not self._snap_ready:
+        # ── Neuen Snapshot abholen (falls vorhanden) ─────────────────────
+        new_snap = False
+        if self._snap_ready:
+            new_snap = True
+            with self._rlock:
+                np.copyto(self._disk_p32, self._render_disk_p32)
+                np.copyto(self._disk_vel_render, self._render_disk_vel32)
+                self._last_snap_time    = self._snap_wall_time
+                self._last_bh_snap      = self._rsnap_bh
+                if self._rsnap_dirty:
+                    np.copyto(self._disk_col, self._rsnap_col)
+                    self._rsnap_dirty = False
+                self._last_phys_ms = self._rsnap_ms
+                self._snap_ready   = False
+
+        # Noch kein einziger Snapshot angekommen → nichts rendern
+        if self._last_snap_time == 0.0:
             return
 
-        # Snapshot unter Lock abholen
-        with self._rlock:
-            np.copyto(self._disk_p32, self._render_disk_p32)
-            np.copyto(self._disk_vel_render, self._render_disk_vel32)
-            snap_time = self._snap_wall_time
-            bh_snap   = self._rsnap_bh
-            col_dirty = self._rsnap_dirty
-            if col_dirty:
-                np.copyto(self._disk_col, self._rsnap_col)
-                self._rsnap_dirty = False
-            ms        = self._rsnap_ms
-            self._snap_ready = False
-
-        fps = 1e3 / ms if ms > 0. else 0.
-
-        # Lineare Interpolation der Positionen zwischen Physik-Frames:
-        # pos_render = pos_snap + vel_snap * dt_seit_snapshot
-        # Begrenzt auf max. 1 Physik-Schritt (keine Überschreitung bei langem Warten).
-        dt_interp = float(np.clip(time.perf_counter() - snap_time, 0., ms * 8e-4))  # max ~80% Schrittzeit
-        np.add(self._disk_p32, self._disk_vel_render * dt_interp,
+        # ── Interpolation (zero-alloc, korrekte Sim-Einheiten) ───────────
+        # vel ist in sim_units/sim_time, nicht sim_units/real_seconds.
+        # Korrekte Formel: pos_interp = pos_snap + vel * dt_sim * fraction
+        # wobei fraction = elapsed_real / step_duration_real ∈ [0, 1]
+        step_s   = self._last_phys_ms * 1e-3        # Schrittdauer in Sekunden
+        elapsed  = time.perf_counter() - self._last_snap_time
+        fraction = float(np.clip(elapsed / step_s, 0., 1.)) if step_s > 1e-6 else 0.
+        # vel * (dt_sim * fraction) → _vel_tmp  (kein temporäres Array)
+        np.multiply(self._disk_vel_render, self.dt * fraction,
+                    out=self._vel_tmp)
+        np.add(self._disk_p32, self._vel_tmp,
                out=self._disk_p32_interp, casting='unsafe')
 
-        # Disk-Scatter aktualisieren
+        # Disk-Scatter: immer Farbe + Größe mitschicken
+        # (vispy setzt bei set_data() ohne face_color den Default 'white' → weiße Partikel)
         self.sc_disk.set_data(
             self._disk_p32_interp,
             face_color=self._disk_col,
             size=self._disk_sz,
             edge_width=0)
 
-        # SMBH-Visuals
-        if bh_snap is not None:
-            bh_pos, sz_s = bh_snap
+        # SMBH-Visuals (nur bei neuem Snapshot)
+        if new_snap and self._last_bh_snap is not None:
+            bh_pos, sz_s = self._last_bh_snap
             assert sz_s is not None
-            sz_g   = sz_s * 1.75
-            col_s  = np.tile([0.02, 0.02, 0.04, 1.00], (len(sz_s), 1)).astype(np.float32)
-            col_g  = np.tile([1.00, 0.68, 0.12, 0.18], (len(sz_s), 1)).astype(np.float32)
-            self.sc_shadow.set_data(bh_pos, face_color=col_s, size=sz_s, edge_width=0)
-            self.sc_glow  .set_data(bh_pos, face_color=col_g, size=sz_g, edge_width=0)
+            sz_g = sz_s * 1.75
+            self.sc_shadow.set_data(bh_pos, face_color=self._bh_col_s[:len(sz_s)],
+                                    size=sz_s, edge_width=0)
+            self.sc_glow  .set_data(bh_pos, face_color=self._bh_col_g[:len(sz_s)],
+                                    size=sz_g, edge_width=0)
 
-        # Titelzeile
-        frag, Esys, nact = self._stats
-        Z_mean = float(self._feedback.Z[~self.bh_m & (self.mass > 0.)].mean()) if nact > 3 else 0.
-        dm_str   = '★DM' if self._dm else ''
-        mode_str = '[Z]' if self._color_mode == 'metallicity' else ''
-        self.canvas.title = (
-            f'N-Body {self.N}  akt:{nact} {dm_str}{mode_str}  |  '
-            f'{fps:.0f} FPS  {ms:.0f}ms  [{self.backend}]  |  '
-            f'SN:{self._total_sn}  <Z>:{Z_mean:.3f}  '
-            f'Zerlg:{frag*100:.1f}%  |  '
-            f'dt={self.dt:.2f}   SPACE +/- R T M B'
-        )
+        # Titelzeile (nur bei neuem Snapshot)
+        if new_snap:
+            fps = (1e3 / self._last_phys_ms) if self._last_phys_ms > 0. else 0.
+            frag, Esys, nact = self._stats
+            dm_str   = '★DM' if self._dm else ''
+            mode_str = '[Z]' if self._color_mode == 'metallicity' else ''
+            self.canvas.title = (
+                f'N-Body {self.N}  akt:{nact} {dm_str}{mode_str}  |  '
+                f'{fps:.0f} phys/s  {self._last_phys_ms:.0f}ms  [{self.backend}]  |  '
+                f'SN:{self._total_sn}  '
+                f'Zerlg:{frag*100:.1f}%  |  '
+                f'dt={self.dt:.2f}   SPACE +/- R T M B'
+            )
+
         self.canvas.update()
         self.frame_n += 1
 
@@ -536,7 +587,7 @@ class GalaxySimVispyViewer:
             if not self.use_bh:
                 print('  Backend-Wechsel nicht verfügbar (N ≤ NUMPY_THRESH)')
                 return
-            cycle = [_BACKEND_BH, _BACKEND_FMM, _BACKEND_PM, _BACKEND_P3M]
+            cycle = [_BACKEND_BH, _BACKEND_FMM, _BACKEND_PM, _BACKEND_P3M, _BACKEND_PY]
             idx   = cycle.index(self.backend) if self.backend in cycle else 0
             self.backend = cycle[(idx + 1) % len(cycle)]
             desc = {
@@ -544,8 +595,21 @@ class GalaxySimVispyViewer:
                 _BACKEND_FMM: 'Fast Multipole O(N)        – Quadrupol-Ordnung p=2',
                 _BACKEND_PM:  'Particle Mesh  O(N+M³logM) – Fernfeld-only, Grid 128³',
                 _BACKEND_P3M: 'P3M Hybrid     BH+PM       – Nahfeld BH + Fernfeld PM',
+                _BACKEND_PY:  'Pure-Python BH O(N log N)  – kein JIT, nur N < 300',
             }
             print(f'  Backend: {desc[self.backend]}')
+        elif k.upper() == 'S':
+            # Snapshot als PNG speichern
+            import time as _time
+            from editor.ui.GalaxyViewer import GalaxyViewer as _GV
+            snap_path = f'snapshot_{int(_time.time())}.png'
+            active = self.mass > 0.
+            _GV.save_snapshot(
+                self.pos, self.r_col, self.mass,
+                path=snap_path, dpi=200,
+                title=f'N-Body Snapshot  –  {int(active.sum())} Partikel',
+            )
+            print(f'  [Snapshot] gespeichert: {snap_path}')
 
     def show(self):
         app.run()

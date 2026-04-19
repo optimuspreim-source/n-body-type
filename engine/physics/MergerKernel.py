@@ -45,6 +45,7 @@ Inaktive Partikel
 ════════════════════════════════════════════════════════════════════════════════
 """
 import numpy as np
+from engine.physics.AABB import SpatialHash
 
 _OFF = 1e7    # "off-screen"-Sentinel für inaktive Partikel
 
@@ -55,6 +56,9 @@ def apply_mergers(pos, vel, mass, bh_indices,
     """
     Führt BH–BH-Verschmelzung und BH–Stern-Akkretion durch.
     Modifiziert pos / vel / mass **in-place**.
+
+    BH–Stern-Akkretion nutzt einen SpatialHash-Index (O(k) statt O(N))
+    um den Suchradius auf tatsächliche Nachbarzellen einzugrenzen.
 
     Rückgabe: (n_bh_merged, n_stars_accreted, accreted_mass_per_bh)
     accreted_mass_per_bh: dict {bh_index: akkretion_masse_in_diesem_schritt}
@@ -90,27 +94,44 @@ def apply_mergers(pos, vel, mass, bh_indices,
             n_bh_merge += 1
             print(f'  [BH-Merger] idx {b} → idx {a}  |  M_neu = {mt:.1f}')
 
-    # ── BH–Stern-Akkretion  (O(k·N), vektorisiert via NumPy) ───────────
+    # ── BH–Stern-Akkretion  (SpatialHash O(k), k = Kandidaten) ─────────
+    # Spatial-Index einmalig über alle aktiven (nicht-BH) Partikel aufbauen.
+    # cell_size = r_accrete → bei r_accrete=3 suchen wir in 27 Zellen (3³).
+    bh_set       = set(bh_indices)
+    active_star  = (mass > 0.) & np.array([i not in bh_set for i in range(len(mass))])
+    sh           = SpatialHash(cell_size=max(r_accrete, 1e-3))
+    sh.build(pos, active_star)
+
     r2_accrete       = r_accrete * r_accrete
     accreted_mass_bh = {}          # bh_idx → akkretierte Masse in diesem Schritt
     for bh in active_bh:
         if bh in dead or mass[bh] <= 0.:
             continue
-        # Quadrat-Abstand aller Partikel zum BH (vektorisiert, kein Python-Loop)
-        dr2      = ((pos - pos[bh]) ** 2).sum(axis=1)
-        accreted = (dr2 < r2_accrete) & (mass > 0.)
-        accreted[bh] = False
-        if not accreted.any():
+
+        # Kandidaten aus Spatial-Index holen (nur Nachbarzellen)
+        cand_raw = sh.query_radius(pos[bh], r_accrete)
+
+        # Exakte Distanz-Prüfung + nur aktive Sterne
+        accreted_idx = []
+        for ci in cand_raw:
+            if ci == bh or mass[ci] <= 0.:
+                continue
+            if float(((pos[ci] - pos[bh]) ** 2).sum()) < r2_accrete:
+                accreted_idx.append(ci)
+
+        if not accreted_idx:
             continue
-        m_acc   = mass[accreted].sum()
-        p_acc   = (vel[accreted] * mass[accreted, np.newaxis]).sum(axis=0)
+
+        acc_arr = np.array(accreted_idx, dtype=np.intp)
+        m_acc   = mass[acc_arr].sum()
+        p_acc   = (vel[acc_arr] * mass[acc_arr, np.newaxis]).sum(axis=0)
         mt      = mass[bh] + m_acc
         # Impulserhaltung für Akkretion
-        vel[bh]       = (vel[bh] * mass[bh] + p_acc) / mt
-        mass[bh]      = mt
-        mass[accreted]= 0.
-        pos[accreted] = _OFF
-        n_acc_total  += int(accreted.sum())
+        vel[bh]        = (vel[bh] * mass[bh] + p_acc) / mt
+        mass[bh]       = mt
+        mass[acc_arr]  = 0.
+        pos[acc_arr]   = _OFF
+        n_acc_total   += len(acc_arr)
         accreted_mass_bh[bh] = float(m_acc)
 
     return n_bh_merge, n_acc_total, accreted_mass_bh

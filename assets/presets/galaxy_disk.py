@@ -62,8 +62,8 @@ def generate_galaxy_disk(
     r_inner         = 3.5,
     mass_center     = 5.0,
     mass_edge       = 0.6,
-    size_center     = 1.4,
-    size_edge       = 0.35,
+    size_center     = 0.18,
+    size_edge       = 0.04,
     disk_color      = (1.0, 0.90, 0.35),   # RGB Zentrumsfarbe
     n_accretion     = 280,
     retrograde_lower= True,
@@ -193,7 +193,7 @@ def generate_galaxy_disk(
         np.clip(0.35 - 0.35 * t_acc, 0.,   0.35),
         np.ones(n_acc) * 0.98,
     ], axis=1).astype(np.float32)
-    acc_sz  = (1.5 - 0.9 * t_acc).astype(np.float32)
+    acc_sz  = (0.19 - 0.11 * t_acc).astype(np.float32)
 
     # ── Zusammenstellen ──────────────────────────────────────────────────
     stars = [bh_entry]
@@ -253,7 +253,7 @@ GALAXY_PRESETS = {
         thickness_ratio=0.010, normal=(0, 0, 1), arms=2,
         arm_tightness=0.37, v_factor=1.18, v_dispersion=0.03,
         r_inner=4.0, mass_center=5.0, mass_edge=0.6,
-        size_center=1.4, size_edge=0.35,
+        size_center=0.18, size_edge=0.04,
         disk_color=(1.0, 0.90, 0.30),
         n_accretion=240, retrograde_lower=True, seed=42,
     ),
@@ -263,7 +263,7 @@ GALAXY_PRESETS = {
         thickness_ratio=0.011, normal=(0., 0.866, 0.5), arms=3,
         arm_tightness=0.42, v_factor=1.20, v_dispersion=0.04,
         r_inner=3.5, mass_center=4.0, mass_edge=0.5,
-        size_center=1.2, size_edge=0.28,
+        size_center=0.15, size_edge=0.035,
         disk_color=(0.25, 0.88, 1.0),
         n_accretion=210, retrograde_lower=True, seed=7,
     ),
@@ -273,7 +273,7 @@ GALAXY_PRESETS = {
         thickness_ratio=0.012, normal=(0.707, 0., 0.707), arms=4,
         arm_tightness=0.46, v_factor=1.15, v_dispersion=0.035,
         r_inner=3.0, mass_center=3.5, mass_edge=0.5,
-        size_center=1.1, size_edge=0.28,
+        size_center=0.14, size_edge=0.035,
         disk_color=(1.0, 0.35, 0.85),
         n_accretion=170, retrograde_lower=False, seed=99,
     ),
